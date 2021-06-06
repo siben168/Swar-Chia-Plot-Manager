@@ -67,6 +67,8 @@ def stop_manager():
         return
     for process in processes:
         try:
+            if process.parent():
+                process.parent().terminate()
             process.terminate()
         except psutil.NoSuchProcess:
             pass

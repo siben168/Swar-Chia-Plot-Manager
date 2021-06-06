@@ -1,6 +1,6 @@
 C:
 cd C:\workspace\pyenv\Scripts
 CALL activate
-cd C:\workspace\chia\Original-Chia-Plot-Manager
+cd C:\workspace\chia\chia-manager\Swar-Chia-Plot-Manager
 python manager.py stop
 pause
