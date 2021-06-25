@@ -21,7 +21,9 @@ def has_active_jobs_and_work(jobs):
 def get_target_directories(job, drives_free_space):
     job_offset = job.total_completed + job.total_running
 
-    job = check_valid_destinations(job, drives_free_space)
+    if job.skip_full_destinations:
+        logging.info('Checking for full destinations.')
+        job = check_valid_destinations(job, drives_free_space)
     destination_directory = job.destination_directory
     temporary_directory = job.temporary_directory
     temporary2_directory = job.temporary2_directory
@@ -65,11 +67,17 @@ def check_valid_destinations(job, drives_free_space):
         
 def load_jobs(config_jobs):
     jobs = []
+    checked_job_names = []
+    checked_temporary_directories = []
     for info in config_jobs:
         job = deepcopy(Job())
         job.total_running = 0
 
         job.name = info['name']
+        if job.name in checked_job_names:
+            raise InvalidConfigurationSetting(f'Found the same job name for multiple jobs. Job names should be unique. '
+                                              f'Duplicate: {job.name}')
+        checked_job_names.append(info['name'])
         job.max_plots = info['max_plots']
 
         job.farmer_public_key = info.get('farmer_public_key', None)
@@ -91,8 +99,18 @@ def load_jobs(config_jobs):
         job.concurrency_start_early_phase_delay = info.get('concurrency_start_early_phase_delay', None)
         job.temporary2_destination_sync = info.get('temporary2_destination_sync', False)
         job.exclude_final_directory = info.get('exclude_final_directory', False)
+        job.skip_full_destinations = info.get('skip_full_destinations', True)
 
-        job.temporary_directory = info['temporary_directory']
+        temporary_directory = info['temporary_directory']
+        if not isinstance(temporary_directory, list):
+            temporary_directory = [temporary_directory]
+        for directory in temporary_directory:
+            if directory not in checked_temporary_directories:
+                checked_temporary_directories.append(directory)
+                continue
+            raise InvalidConfigurationSetting(f'You cannot use the same temporary directory for more than one job: '
+                                              f'{directory}')
+        job.temporary_directory = temporary_directory
         job.destination_directory = info['destination_directory']
 
         temporary2_directory = info.get('temporary2_directory', None)
@@ -108,7 +126,7 @@ def load_jobs(config_jobs):
 
         job.unix_process_priority = info.get('unix_process_priority', 10)
         if not -20 <= job.unix_process_priority <= 20:
-            raise InvalidConfigurationSetting('UNIX Process Priority must be between -20 and 20.')
+            raise InvalidConfigurationSetting('UNIX Process Priority must be between -20 and 19.')
         job.windows_process_priority = info.get('windows_process_priority', 32)
         if job.windows_process_priority not in [64, 16384, 32, 32768, 128, 256]:
             raise InvalidConfigurationSetting('Windows Process Priority must any of the following: [64, 16384, 32, '
@@ -140,8 +158,8 @@ def determine_job_size(k_size):
     return size
 
 
-def monitor_jobs_to_start(jobs, running_work, max_concurrent, next_job_work, chia_location, log_directory,
-                          next_log_check, system_drives):
+def monitor_jobs_to_start(jobs, running_work, max_concurrent, max_for_phase_1, next_job_work, chia_location,
+                          log_directory, next_log_check, minimum_minutes_between_jobs, system_drives):
     drives_free_space = {}
     for job in jobs:
         directories = [job.destination_directory]
@@ -169,11 +187,21 @@ def monitor_jobs_to_start(jobs, running_work, max_concurrent, next_job_work, chi
         logging.info(drive)
     logging.info(f'Free space after checking active jobs: {drives_free_space}')
 
+    total_phase_1_count = 0
+    for pid in running_work.keys():
+        if running_work[pid].current_phase > 1:
+            continue
+        total_phase_1_count += 1
+
     for i, job in enumerate(jobs):
         logging.info(f'Checking to queue work for job: {job.name}')
         if len(running_work.values()) >= max_concurrent:
             logging.info(f'Global concurrent limit met, skipping. Running plots: {len(running_work.values())}, '
                          f'Max global concurrent limit: {max_concurrent}')
+            continue
+        if total_phase_1_count >= max_for_phase_1:
+            logging.info(f'Global max for phase 1 limit has been met, skipping. Count: {total_phase_1_count}, '
+                         f'Setting Max: {max_for_phase_1}')
             continue
         phase_1_count = 0
         for pid in job.running_work:
@@ -182,7 +210,7 @@ def monitor_jobs_to_start(jobs, running_work, max_concurrent, next_job_work, chi
             phase_1_count += 1
         logging.info(f'Total jobs in phase 1: {phase_1_count}')
         if job.max_for_phase_1 and phase_1_count >= job.max_for_phase_1:
-            logging.info(f'Max for phase 1 met, skipping. Max: {job.max_for_phase_1}')
+            logging.info(f'Job max for phase 1 met, skipping. Max: {job.max_for_phase_1}')
             continue
         if job.total_kicked_off >= job.max_plots:
             logging.info(f'Job\'s total kicked off greater than or equal to max plots, skipping. Total Kicked Off: '
@@ -215,6 +243,17 @@ def monitor_jobs_to_start(jobs, running_work, max_concurrent, next_job_work, chi
         if job.stagger_minutes:
             next_job_work[job.name] = datetime.now() + timedelta(minutes=job.stagger_minutes)
             logging.info(f'Calculating new job stagger time. Next stagger kickoff: {next_job_work[job.name]}')
+        if minimum_minutes_between_jobs:
+            logging.info(f'Setting a minimum stagger for all jobs. {minimum_minutes_between_jobs}')
+            minimum_stagger = datetime.now() + timedelta(minutes=minimum_minutes_between_jobs)
+            for j in jobs:
+                if next_job_work[j.name] > minimum_stagger:
+                    logging.info(f'Skipping stagger for {j.name}. Stagger is larger than minimum_minutes_between_jobs. '
+                                 f'Min: {minimum_stagger}, Current: {next_job_work[j.name]}')
+                    continue
+                logging.info(f'Setting a new stagger for {j.name}. minimum_minutes_between_jobs is larger than assigned '
+                             f'stagger. Min: {minimum_stagger}, Current: {next_job_work[j.name]}')
+                next_job_work[j.name] = minimum_stagger
 
         job, work = start_work(
             job=job,
@@ -225,6 +264,7 @@ def monitor_jobs_to_start(jobs, running_work, max_concurrent, next_job_work, chi
         jobs[i] = deepcopy(job)
         if work is None:
             continue
+        total_phase_1_count += 1
         next_log_check = datetime.now()
         running_work[work.pid] = work
 
